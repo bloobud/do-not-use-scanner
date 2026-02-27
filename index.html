@@ -1,1 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Do Not Use Scanner</title>
+  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar__inner">
+      <div class="brand">
+        <div class="brand__logo">DNU</div>
+        <div class="brand__text">
+          <div class="brand__title">Do Not Use Scanner</div>
+          <div class="brand__sub">Client-side face matching • runs in your browser</div>
+        </div>
+      </div>
 
+      <div class="topbar__actions">
+        <button id="btnHelp" class="btn btn--ghost">Help</button>
+        <button id="btnExport" class="btn btn--ghost">Export People</button>
+        <button id="btnImport" class="btn btn--ghost">Import People</button>
+        <input id="importFile" type="file" accept="application/json" hidden />
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap main">
+    <section class="panel panel--people">
+      <div class="panel__head">
+        <h2>People (Do Not Use)</h2>
+        <div class="muted" id="peopleCount">0 people</div>
+      </div>
+
+      <div class="people__add">
+        <input id="personName" class="input" placeholder="Add person name (e.g., John DNU)" />
+        <button id="btnAddPerson" class="btn btn--primary">Add</button>
+      </div>
+
+      <div class="people__list" id="peopleList"></div>
+
+      <div class="people__foot">
+        <button id="btnClearAll" class="btn btn--danger btn--block">Clear All People</button>
+        <div class="fineprint">
+          Tip: add 3–8 face samples per person (different angles/lighting). More samples = fewer misses.
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel--work">
+      <div class="panel__head">
+        <h2>Enroll + Scan</h2>
+        <div class="muted" id="modelStatus">Loading models…</div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <div class="card__title">1) Add face samples</div>
+          <div class="card__sub">Select a person, upload photos, then click face crops to add samples.</div>
+
+          <div class="row">
+            <select id="personSelect" class="select"></select>
+            <label class="btn btn--ghost">
+              Upload Photos
+              <input id="enrollInput" type="file" accept="image/*" multiple hidden />
+            </label>
+          </div>
+
+          <div class="drop" id="enrollDrop">
+            <div class="drop__title">Drag photos here</div>
+            <div class="drop__sub">We’ll detect faces and show crops you can click to add.</div>
+          </div>
+
+          <div class="muted small" id="enrollStatus"></div>
+          <div class="crops" id="crops"></div>
+        </div>
+
+        <div class="card">
+          <div class="card__title">2) Scan photos</div>
+          <div class="card__sub">Upload a batch. We’ll flag photos that contain restricted people.</div>
+
+          <div class="row">
+            <label class="btn btn--primary">
+              Upload Batch
+              <input id="scanInput" type="file" accept="image/*" multiple hidden />
+            </label>
+
+            <button id="btnScan" class="btn btn--ghost" disabled>Scan</button>
+          </div>
+
+          <div class="slider">
+            <div class="slider__top">
+              <div><b>Match threshold</b> <span class="muted">(lower = stricter)</span></div>
+              <div class="pill">Distance: <span id="thrVal">0.52</span></div>
+            </div>
+            <input id="threshold" type="range" min="0.35" max="0.75" step="0.01" value="0.52" />
+            <div class="muted small">Typical: 0.45–0.60. If you’re getting false flags, lower it. If you’re missing matches, raise it slightly.</div>
+          </div>
+
+          <div class="muted small" id="scanStatus"></div>
+          <div class="results" id="results"></div>
+
+          <div class="preview">
+            <div class="preview__head">
+              <div class="card__title">Preview</div>
+              <div class="muted small">Red boxes = restricted match</div>
+            </div>
+            <canvas id="previewCanvas"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="helpDialog" class="dialog">
+    <div class="dialog__inner">
+      <div class="dialog__head">
+        <h3>How to use</h3>
+        <button id="btnCloseHelp" class="btn btn--ghost">Close</button>
+      </div>
+      <ol class="help">
+        <li><b>Add people</b> in the left panel.</li>
+        <li>Select a person → upload photos → click face crops to save samples.</li>
+        <li>Upload a new batch → click <b>Scan</b> → review flagged photos + preview.</li>
+        <li>Use <b>Export People</b> to back up your list (or share between computers).</li>
+      </ol>
+      <div class="fineprint">
+        All processing happens in your browser. Photos are not uploaded to a third-party service.
+      </div>
+    </div>
+  </dialog>
+
+  <script defer src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script defer src="./app.js"></script>
+</body>
+</html>
