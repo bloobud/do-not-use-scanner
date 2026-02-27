@@ -1,10 +1,13 @@
-// app.js — "Closest match only" + "Draw boxes only when matched"
-// Uses face-api.js TinyFaceDetector + upscales small faces before detection.
+// app.js — DNU Scanner
+// - Only labels the SINGLE closest match from enrolled people
+// - Only draws boxes for matched faces
+// - Filters bogus detections (prevents "arm/torso is a face")
+// - Upscales images to help small faces
 // Models must be at /models on the SAME site.
 
 const MODEL_URL = "/models";
 
-// ---------- Elements ----------
+// -------------------- Elements --------------------
 const el = (id) => document.getElementById(id);
 
 const modelStatus = el("modelStatus");
@@ -34,11 +37,9 @@ const threshold = el("threshold");
 const thrVal = el("thrVal");
 
 const resultsFlagged = el("resultsFlagged");
-const resultsPossible = el("resultsPossible"); // will be unused, but kept so your HTML doesn't break
 const resultsClear = el("resultsClear");
 
 const countFlagged = el("countFlagged");
-const countPossible = el("countPossible"); // will be unused
 const countClear = el("countClear");
 
 const previewCanvas = el("previewCanvas");
@@ -51,26 +52,35 @@ const helpDialog = el("helpDialog");
 const btnHelp = el("btnHelp");
 const btnCloseHelp = el("btnCloseHelp");
 
-// ---------- Data ----------
+// -------------------- Data --------------------
 let modelsReady = false;
 
-let people = loadPeople();           // [{id,name,samples:number[][]}]
-let scanSelection = loadSelection(); // { [personId]: boolean }
+let people = loadPeople();            // [{id, name, samples:number[][]}]
+let scanSelection = loadSelection();  // { [id]: boolean }
 
-// ---------- Settings ----------
-const DETECTOR_ENROLL = { inputSize: 608, scoreThreshold: 0.08 };
-const DETECTOR_SCAN   = { inputSize: 608, scoreThreshold: 0.08 };
+// -------------------- Settings --------------------
+// Detector settings: keep normal pass strict-ish; fallback slightly looser (but not crazy).
+const DETECTOR_ENROLL = { inputSize: 608, scoreThreshold: 0.12 };
+const DETECTOR_SCAN   = { inputSize: 608, scoreThreshold: 0.12 };
+
+// Fallback: more sensitive, but still avoids tons of bogus detections.
+const DETECTOR_FALLBACK = { inputSize: 608, scoreThreshold: 0.18 };
 
 const ENROLL_MIN_SIDE = 700;
 const SCAN_MIN_SIDE   = 900;
 
 const MAX_FACES_PER_IMAGE = 30;
 
-// IMPORTANT: for “only show actual matches” start stricter.
-// If you miss matches, raise slowly (0.55 -> 0.58 -> 0.60)
+// Start strict for “only show real matches”
 const DEFAULT_THRESHOLD = 0.55;
 
-// ---------- Helpers ----------
+// Plausibility filters (these kill "arm face" boxes)
+const MIN_FACE_PX = 40;            // too small → ignore
+const MIN_DET_SCORE = 0.35;        // too low confidence → ignore
+const MIN_AR = 0.65;               // aspect ratio lower bound
+const MAX_AR = 1.60;               // aspect ratio upper bound
+
+// -------------------- Helpers --------------------
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
@@ -111,7 +121,8 @@ function totalSamples() {
   return people.reduce((sum, p) => sum + (p.samples?.length || 0), 0);
 }
 function selectedPeople() {
-  return people.filter((p) => scanSelection[p.id] !== false); // default true
+  // default true
+  return people.filter((p) => scanSelection[p.id] !== false);
 }
 function syncSelection() {
   const known = new Set(people.map((p) => p.id));
@@ -133,7 +144,7 @@ function dist(a, b) {
   return Math.sqrt(s);
 }
 
-// This is NOT a true probability—just a UX helper.
+// UX-only number (not a true probability)
 function distanceToConfidence(d, thr) {
   const max = thr + 0.25;
   const clamped = Math.max(0, Math.min(1, 1 - d / max));
@@ -177,8 +188,30 @@ async function detectAll(canvasOrImg, detectorOpts) {
     .withFaceDescriptors();
 }
 
-// ✅ Closest match only.
-// Returns {personId, name, dist, confidence} OR null (if no one passes threshold).
+// Filters bogus detections (prevents "arm as face")
+function isPlausibleFace(det, detScale, img) {
+  const b = det.detection.box;
+  const score = det.detection.score ?? 0;
+
+  // map to original image coords
+  const w = b.width / detScale;
+  const h = b.height / detScale;
+
+  if (score < MIN_DET_SCORE) return false;
+
+  const minSide = Math.min(w, h);
+  if (minSide < MIN_FACE_PX) return false;
+
+  const ar = w / h;
+  if (ar < MIN_AR || ar > MAX_AR) return false;
+
+  // ignore absurdly huge boxes
+  if (w > img.width * 0.75 || h > img.height * 0.75) return false;
+
+  return true;
+}
+
+// ✅ Closest match only (or null if no one passes threshold)
 function bestMatchForDescriptor(descriptor, thr) {
   const pool = selectedPeople();
 
@@ -207,7 +240,6 @@ function bestMatchForDescriptor(descriptor, thr) {
     }
   }
 
-  // Only count it as a match if it passes threshold
   if (!best || best.dist > thr) return null;
   return best;
 }
@@ -217,21 +249,25 @@ function dedupeNames(bestMatches) {
   return Array.from(set);
 }
 
-// ---------- Rendering ----------
+// -------------------- Rendering --------------------
 function clearBuckets() {
   resultsFlagged.innerHTML = "";
-  if (resultsPossible) resultsPossible.innerHTML = ""; // unused
   resultsClear.innerHTML = "";
   countFlagged.textContent = "0";
-  if (countPossible) countPossible.textContent = "0";
   countClear.textContent = "0";
 }
 
 function updateButtons() {
   btnAddPerson.disabled = !personName.value.trim();
+
   const pool = selectedPeople();
-  const poolSamples = pool.reduce((s,p) => s + (p.samples?.length || 0), 0);
-  btnScan.disabled = !modelsReady || (scanInput.files?.length || 0) === 0 || pool.length === 0 || poolSamples === 0;
+  const poolSamples = pool.reduce((s, p) => s + (p.samples?.length || 0), 0);
+
+  btnScan.disabled =
+    !modelsReady ||
+    (scanInput.files?.length || 0) === 0 ||
+    pool.length === 0 ||
+    poolSamples === 0;
 }
 
 function renderPeople() {
@@ -354,13 +390,14 @@ function renderAll() {
 }
 renderAll();
 
-// ---------- Model loading ----------
+// -------------------- Model loading --------------------
 async function loadModels() {
   setStatus(modelStatus, "Loading models…");
   try {
     await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
     await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
     await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+
     modelsReady = true;
     setStatus(modelStatus, "Models loaded ✓");
   } catch (e) {
@@ -372,13 +409,13 @@ async function loadModels() {
 }
 loadModels();
 
-// ---------- Defaults ----------
+// -------------------- Defaults --------------------
 if (threshold) {
   threshold.value = String(DEFAULT_THRESHOLD);
   thrVal.textContent = String(DEFAULT_THRESHOLD);
 }
 
-// ---------- People controls ----------
+// -------------------- People controls --------------------
 personName.addEventListener("input", updateButtons);
 
 btnAddPerson.addEventListener("click", () => {
@@ -415,12 +452,12 @@ btnNone.addEventListener("click", () => {
   updateButtons();
 });
 
-// ---------- Threshold UI ----------
+// -------------------- Threshold UI --------------------
 threshold.addEventListener("input", () => {
   thrVal.textContent = threshold.value;
 });
 
-// ---------- Dropzone ----------
+// -------------------- Dropzone --------------------
 function setupDropzone(dropEl, onFiles) {
   dropEl.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -439,7 +476,7 @@ setupDropzone(enrollDrop, async (files) => {
   await handleEnrollFiles(files);
 });
 
-// ---------- Enroll ----------
+// -------------------- Enroll --------------------
 enrollInput.addEventListener("change", async () => {
   const files = Array.from(enrollInput.files || []);
   await handleEnrollFiles(files);
@@ -462,14 +499,13 @@ async function handleEnrollFiles(files) {
   for (const file of files) {
     const img = await fileToImage(file);
 
-    // Upscale for detection
     const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE);
 
     let detections = await detectAll(canvas, DETECTOR_ENROLL);
 
-    // Fallback more sensitive
     if (!detections.length) {
-      detections = await detectAll(canvas, { inputSize: 608, scoreThreshold: 0.04 });
+      // try fallback if nothing was found
+      detections = await detectAll(canvas, DETECTOR_FALLBACK);
     }
 
     if (!detections.length) continue;
@@ -477,15 +513,18 @@ async function handleEnrollFiles(files) {
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
 
     for (const det of trimmed) {
+      if (!isPlausibleFace(det, scale, img)) continue;
+
       found++;
       const box = det.detection.box;
 
-      // Map detection coords (upscaled) back to original image coords
+      // map detection coords (upscaled) back to original
       const ox = box.x / scale;
       const oy = box.y / scale;
       const ow = box.width / scale;
       const oh = box.height / scale;
 
+      // generous padding so descriptor sees more of the face
       const pad = Math.max(12, Math.round(Math.min(ow, oh) * 0.18));
       const x = Math.max(0, Math.floor(ox - pad));
       const y = Math.max(0, Math.floor(oy - pad));
@@ -528,14 +567,14 @@ async function handleEnrollFiles(files) {
   if (!found) {
     setStatus(
       enrollStatus,
-      "No faces found. Try a clearer/closer photo (face larger, less blur). Tiny faces in crowds can be missed."
+      "No faces found. Try a clearer/closer photo (face larger, less blur)."
     );
   } else {
     setStatus(enrollStatus, `Found ${found} face(s). Click crops to add samples to ${person.name}.`);
   }
 }
 
-// ---------- Scan ----------
+// -------------------- Scan --------------------
 scanInput.addEventListener("change", updateButtons);
 
 btnScan.addEventListener("click", async () => {
@@ -564,43 +603,44 @@ btnScan.addEventListener("click", async () => {
 
     const img = await fileToImage(file);
 
-    // Upscale for better small-face detection
     const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE);
 
     let detections = await detectAll(canvas, DETECTOR_SCAN);
 
-    // Fallback more sensitive
     if (!detections.length) {
-      detections = await detectAll(canvas, { inputSize: 608, scoreThreshold: 0.04 });
+      detections = await detectAll(canvas, DETECTOR_FALLBACK);
     }
 
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
 
-    // For each detected face, compute ONLY the closest match (or null)
-    const faceResults = trimmed.map((det) => {
+    // compute best match only for plausible detections
+    const faceResults = [];
+    for (const det of trimmed) {
+      if (!isPlausibleFace(det, scale, img)) continue;
+
       const desc = Array.from(det.descriptor);
       const best = bestMatchForDescriptor(desc, thr);
-      return { det, best, scale };
-    });
+      faceResults.push({ det, best, scale });
+    }
 
     const matchedFaces = faceResults.filter((fr) => fr.best);
 
-    let status = "clear";
-    if (matchedFaces.length) status = "flagged";
+    const status = matchedFaces.length ? "flagged" : "clear";
 
-    const names = status === "flagged" ? dedupeNames(matchedFaces.map((m) => m.best)) : [];
+    const names = matchedFaces.length ? dedupeNames(matchedFaces.map((m) => m.best)) : [];
     const label = names.length
       ? `${names.slice(0, 3).join(", ")}${names.length > 3 ? ` +${names.length - 3}` : ""}`
       : "—";
 
-    // Render result row
     const row = document.createElement("div");
     row.className = "result";
 
     const left = document.createElement("div");
     left.innerHTML = `
       <div class="result__name">${escapeHtml(file.name)}</div>
-      <div class="result__sub">${trimmed.length} face(s) detected • ${status === "clear" ? "No matches" : `Matched: ${escapeHtml(label)}`}</div>
+      <div class="result__sub">
+        ${trimmed.length} face(s) detected • ${status === "clear" ? "No matches" : `Matched: ${escapeHtml(label)}`}
+      </div>
     `;
 
     const right = document.createElement("div");
@@ -632,7 +672,6 @@ btnScan.addEventListener("click", async () => {
     }
 
     countFlagged.textContent = String(flaggedCount);
-    if (countPossible) countPossible.textContent = "0";
     countClear.textContent = String(clearCount);
 
     await yieldToUI();
@@ -640,11 +679,11 @@ btnScan.addEventListener("click", async () => {
 
   setStatus(
     scanStatus,
-    `Done. Matched ${flaggedCount} • Clear ${clearCount}. Threshold ${thr.toFixed(2)}. (Only matched faces are boxed/labeled.)`
+    `Done. Matched ${flaggedCount} • Clear ${clearCount}. Threshold ${thr.toFixed(2)}.`
   );
 });
 
-// ---------- Preview ----------
+// -------------------- Preview --------------------
 function clearPreview() {
   const ctx = previewCanvas.getContext("2d");
   previewCanvas.width = 1;
@@ -667,14 +706,13 @@ function drawPreview(img, faceResults) {
   ctx.font = "14px system-ui";
   ctx.textBaseline = "top";
 
-  // ✅ ONLY DRAW BOXES FOR MATCHED FACES
+  // ✅ ONLY DRAW MATCHED FACES
   for (const fr of faceResults) {
     if (!fr.best) continue;
 
     const detScale = fr.scale || 1;
     const b = fr.det.detection.box;
 
-    // Convert detection box (upscaled) back to original image coords, then to preview canvas coords
     const ox = b.x / detScale;
     const oy = b.y / detScale;
     const ow = b.width / detScale;
@@ -701,7 +739,7 @@ function drawPreview(img, faceResults) {
   }
 }
 
-// ---------- Export / Import ----------
+// -------------------- Export / Import --------------------
 btnExport.addEventListener("click", () => {
   const blob = new Blob([JSON.stringify({ version: 2, people }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -736,7 +774,7 @@ importFile.addEventListener("change", async () => {
   }
 });
 
-// ---------- Help dialog ----------
+// -------------------- Help dialog --------------------
 btnHelp.addEventListener("click", () => helpDialog.showModal());
 btnCloseHelp.addEventListener("click", () => helpDialog.close());
 helpDialog.addEventListener("click", (e) => {
@@ -748,6 +786,6 @@ helpDialog.addEventListener("click", (e) => {
   if (!inDialog) helpDialog.close();
 });
 
-// ---------- Init ----------
+// -------------------- Init --------------------
 syncSelection();
 renderAll();
