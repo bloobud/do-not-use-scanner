@@ -1,8 +1,8 @@
-// app.js — DNU Scanner
+// app.js — DNU Scanner (performance + stability update)
 // - Only labels the SINGLE closest match from enrolled people
 // - Only draws boxes for matched faces
 // - Filters bogus detections (prevents "arm/torso is a face")
-// - Upscales images to help small faces
+// - Upscales images to help small faces, BUT caps max dimension so it won’t hang
 // Models must be at /models on the SAME site.
 
 const MODEL_URL = "/models";
@@ -59,17 +59,26 @@ let people = loadPeople();            // [{id, name, samples:number[][]}]
 let scanSelection = loadSelection();  // { [id]: boolean }
 
 // -------------------- Settings --------------------
-// Detector settings: keep normal pass strict-ish; fallback slightly looser (but not crazy).
+// Detector settings
 const DETECTOR_ENROLL = { inputSize: 608, scoreThreshold: 0.12 };
 const DETECTOR_SCAN   = { inputSize: 608, scoreThreshold: 0.12 };
 
-// Fallback: more sensitive, but still avoids tons of bogus detections.
-const DETECTOR_FALLBACK = { inputSize: 608, scoreThreshold: 0.18 };
+// Fallback: slightly MORE sensitive (lower threshold), not stricter.
+// (Higher scoreThreshold = stricter, which often finds fewer faces.)
+const DETECTOR_FALLBACK = { inputSize: 608, scoreThreshold: 0.06 };
 
 const ENROLL_MIN_SIDE = 700;
 const SCAN_MIN_SIDE   = 900;
 
-const MAX_FACES_PER_IMAGE = 30;
+// Performance caps
+const MAX_DIM_ENROLL = 1600; // cap processing canvas (enroll)
+const MAX_DIM_SCAN   = 1400; // cap processing canvas (scan) — lower = faster
+const MAX_FACES_PER_IMAGE_ENROLL = 30;
+const MAX_FACES_PER_IMAGE_SCAN   = 15; // lower this to avoid crowd-photo slowdowns
+
+// Timeouts (ms)
+const DETECT_TIMEOUT_MS = 15000;   // detection+descriptor timeout per image
+const FILE_DECODE_TIMEOUT_MS = 8000;
 
 // Start strict for “only show real matches”
 const DEFAULT_THRESHOLD = 0.55;
@@ -151,27 +160,51 @@ function distanceToConfidence(d, thr) {
   return Math.round(clamped * 100);
 }
 
-async function fileToImage(file) {
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.src = url;
-  await img.decode();
-  URL.revokeObjectURL(url);
-  return img;
-}
-
 function yieldToUI() {
   return new Promise((r) => setTimeout(r, 0));
 }
 
-// Upscale for better detection of small faces
-function imageToDetectionCanvas(img, targetMinSide) {
+function withTimeout(promise, ms, label = "timeout") {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(label)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+async function fileToImage(file) {
+  // ObjectURL decode can hang on some formats; we guard it.
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+
+    // img.decode() is best, but we wrap with timeout
+    await withTimeout(img.decode(), FILE_DECODE_TIMEOUT_MS, "image decode timed out");
+
+    return img;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// Upscale for small faces BUT cap max size so big photos don’t kill performance.
+function imageToDetectionCanvas(img, targetMinSide, maxDim) {
   const minSide = Math.min(img.width, img.height);
-  const scale = minSide < targetMinSide ? (targetMinSide / minSide) : 1;
+  let scale = minSide < targetMinSide ? (targetMinSide / minSide) : 1;
+
+  // cap max dimension
+  const outW = Math.round(img.width * scale);
+  const outH = Math.round(img.height * scale);
+  const maxOut = Math.max(outW, outH);
+  if (maxOut > maxDim) {
+    scale = scale * (maxDim / maxOut);
+  }
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.round(img.width * scale);
-  canvas.height = Math.round(img.height * scale);
+  canvas.width = Math.max(1, Math.round(img.width * scale));
+  canvas.height = Math.max(1, Math.round(img.height * scale));
 
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = true;
@@ -483,6 +516,26 @@ enrollInput.addEventListener("change", async () => {
   enrollInput.value = "";
 });
 
+async function safeDetect(canvas, primary, fallback) {
+  // Detect with timeout + fallback
+  let dets = [];
+  try {
+    dets = await withTimeout(detectAll(canvas, primary), DETECT_TIMEOUT_MS, "detect timeout");
+  } catch (e) {
+    console.warn("detect timed out (primary)", e);
+    dets = [];
+  }
+  if (dets.length) return dets;
+
+  try {
+    dets = await withTimeout(detectAll(canvas, fallback), DETECT_TIMEOUT_MS, "detect timeout");
+  } catch (e) {
+    console.warn("detect timed out (fallback)", e);
+    dets = [];
+  }
+  return dets;
+}
+
 async function handleEnrollFiles(files) {
   if (!modelsReady) return setStatus(enrollStatus, "Models not ready yet.");
   const pid = personSelect.value;
@@ -497,20 +550,20 @@ async function handleEnrollFiles(files) {
   let found = 0;
 
   for (const file of files) {
-    const img = await fileToImage(file);
-
-    const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE);
-
-    let detections = await detectAll(canvas, DETECTOR_ENROLL);
-
-    if (!detections.length) {
-      // try fallback if nothing was found
-      detections = await detectAll(canvas, DETECTOR_FALLBACK);
+    let img;
+    try {
+      img = await fileToImage(file);
+    } catch (e) {
+      console.warn("Skipping unreadable image:", file.name, e);
+      continue;
     }
 
+    const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE, MAX_DIM_ENROLL);
+
+    const detections = await safeDetect(canvas, DETECTOR_ENROLL, DETECTOR_FALLBACK);
     if (!detections.length) continue;
 
-    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
+    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE_ENROLL);
 
     for (const det of trimmed) {
       if (!isPlausibleFace(det, scale, img)) continue;
@@ -601,17 +654,19 @@ btnScan.addEventListener("click", async () => {
     const file = files[i];
     setStatus(scanStatus, `Scanning ${i + 1} / ${files.length}…`);
 
-    const img = await fileToImage(file);
-
-    const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE);
-
-    let detections = await detectAll(canvas, DETECTOR_SCAN);
-
-    if (!detections.length) {
-      detections = await detectAll(canvas, DETECTOR_FALLBACK);
+    let img;
+    try {
+      img = await fileToImage(file);
+    } catch (e) {
+      console.warn("Skipping unreadable image:", file.name, e);
+      continue;
     }
 
-    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
+    const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE, MAX_DIM_SCAN);
+
+    const detections = await safeDetect(canvas, DETECTOR_SCAN, DETECTOR_FALLBACK);
+
+    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE_SCAN);
 
     // compute best match only for plausible detections
     const faceResults = [];
@@ -674,6 +729,7 @@ btnScan.addEventListener("click", async () => {
     countFlagged.textContent = String(flaggedCount);
     countClear.textContent = String(clearCount);
 
+    // Important: yield so the UI remains responsive
     await yieldToUI();
   }
 
