@@ -1,9 +1,10 @@
-// app.js — Multi-person scanning + filters + confidence + buckets + preview labels
-// Models are served locally in same Netlify site: /models
+// app.js — Improved detection for crowd/stage + multi-person scan
+// Uses face-api.js TinyFaceDetector (no extra models) + upscales small faces before detection.
+// Models must be hosted at /models on the SAME site.
 
 const MODEL_URL = "/models";
 
-// Elements
+// ---------- Elements ----------
 const el = (id) => document.getElementById(id);
 
 const modelStatus = el("modelStatus");
@@ -50,38 +51,47 @@ const helpDialog = el("helpDialog");
 const btnHelp = el("btnHelp");
 const btnCloseHelp = el("btnCloseHelp");
 
-// Data
+// ---------- Data ----------
 let modelsReady = false;
 
-// people = [{id,name,samples:number[][]}]
-// scanSelection = { [personId]: boolean }
-let people = loadPeople();
-let scanSelection = loadSelection();
+let people = loadPeople();           // [{id,name,samples:number[][]}]
+let scanSelection = loadSelection(); // { [personId]: boolean }
 
-// Performance knobs
-const DETECTOR = {
-  inputSize: 416,         // 320 = faster, 512 = better
-  scoreThreshold: 0.10    // lower = more sensitive
-};
-const BORDERLINE_BAND = 0.06; // threshold -> threshold+band = "Possible"
-const MAX_FACES_PER_IMAGE = 20; // sanity cap
+// ---------- Settings (tune here) ----------
+// Valid TinyFaceDetector input sizes are multiples of 32 (128–608).
+// 608 = best small-face detection (slower). 416 = decent + faster.
+const DETECTOR_ENROLL = { inputSize: 608, scoreThreshold: 0.08 };
+const DETECTOR_SCAN   = { inputSize: 608, scoreThreshold: 0.08 };
+
+// How much to upscale before detection.
+// Enrollment is usually portraits; scanning is often crowd shots.
+const ENROLL_MIN_SIDE = 700; // if smallest side is < this, upscale to this
+const SCAN_MIN_SIDE   = 900; // more aggressive for crowd/stage
+
+// How many faces per image to process (prevents huge crowd images from freezing)
+const MAX_FACES_PER_IMAGE = 30;
+
+// Recognition thresholds (distance)
+const DEFAULT_THRESHOLD = 0.60;  // Real-world default (0.52 is often too strict)
+const BORDERLINE_BAND = 0.10;    // threshold..threshold+band => "Possible"
 
 // ---------- Helpers ----------
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
-
 function setStatus(target, msg) {
   target.textContent = msg || "";
 }
-
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (m) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"
+  }[m]));
+}
 function savePeople() {
   localStorage.setItem("dnu_people_v2", JSON.stringify(people));
-  // Keep selection in sync (new people default to checked)
   syncSelection();
   renderAll();
 }
-
 function loadPeople() {
   try {
     const raw = localStorage.getItem("dnu_people_v2") || localStorage.getItem("dnu_people_v1");
@@ -90,11 +100,9 @@ function loadPeople() {
     return [];
   }
 }
-
 function saveSelection() {
   localStorage.setItem("dnu_selection_v2", JSON.stringify(scanSelection));
 }
-
 function loadSelection() {
   try {
     const raw = localStorage.getItem("dnu_selection_v2");
@@ -103,15 +111,21 @@ function loadSelection() {
     return {};
   }
 }
-
 function totalSamples() {
   return people.reduce((sum, p) => sum + (p.samples?.length || 0), 0);
 }
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, m => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"
-  }[m]));
+function selectedPeople() {
+  return people.filter((p) => scanSelection[p.id] !== false); // default true
+}
+function syncSelection() {
+  const known = new Set(people.map((p) => p.id));
+  for (const p of people) {
+    if (!(p.id in scanSelection)) scanSelection[p.id] = true;
+  }
+  for (const id of Object.keys(scanSelection)) {
+    if (!known.has(id)) delete scanSelection[id];
+  }
+  saveSelection();
 }
 
 function dist(a, b) {
@@ -123,12 +137,10 @@ function dist(a, b) {
   return Math.sqrt(s);
 }
 
-// distance -> a rough % (not scientifically “probability”, but usable UX)
+// Distance -> rough "confidence" for UX (not a true probability)
 function distanceToConfidence(d, thr) {
-  // 0.0 => 100%, thr => ~60%, thr+band => ~40%, bigger => lower
-  const band = BORDERLINE_BAND;
-  const max = thr + band + 0.20;
-  const clamped = Math.max(0, Math.min(1, 1 - (d / max)));
+  const max = thr + BORDERLINE_BAND + 0.25;
+  const clamped = Math.max(0, Math.min(1, 1 - d / max));
   return Math.round(clamped * 100);
 }
 
@@ -142,27 +154,35 @@ async function fileToImage(file) {
 }
 
 function yieldToUI() {
-  return new Promise(r => setTimeout(r, 0));
+  return new Promise((r) => setTimeout(r, 0));
 }
 
-function selectedPeople() {
-  return people.filter(p => scanSelection[p.id] !== false); // default true
+// Upscale an image into a canvas for better face detection (tiny faces / crowd shots)
+function imageToDetectionCanvas(img, targetMinSide) {
+  const minSide = Math.min(img.width, img.height);
+  const scale = minSide < targetMinSide ? (targetMinSide / minSide) : 1;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  return { canvas, scale };
 }
 
-function syncSelection() {
-  // New people default selected
-  const known = new Set(people.map(p => p.id));
-  for (const p of people) {
-    if (!(p.id in scanSelection)) scanSelection[p.id] = true;
-  }
-  // Remove deleted people
-  for (const id of Object.keys(scanSelection)) {
-    if (!known.has(id)) delete scanSelection[id];
-  }
-  saveSelection();
+// Core detect function (TinyFaceDetector)
+async function detectAll(canvasOrImg, detectorOpts) {
+  return await faceapi
+    .detectAllFaces(canvasOrImg, new faceapi.TinyFaceDetectorOptions(detectorOpts))
+    .withFaceLandmarks()
+    .withFaceDescriptors();
 }
 
-// For scanning: compute best match per person, return top matches
+// Match a descriptor against selected people
 function matchesForDescriptor(descriptor, thr) {
   const pool = selectedPeople();
   const hits = [];
@@ -173,8 +193,7 @@ function matchesForDescriptor(descriptor, thr) {
     for (const s of (p.samples || [])) {
       const d = dist(descriptor, s);
       if (d < best) best = d;
-      // small early-exit
-      if (best < 0.20) break;
+      if (best < 0.20) break; // tiny early-exit
     }
     if (!isFinite(best)) continue;
 
@@ -191,7 +210,32 @@ function matchesForDescriptor(descriptor, thr) {
   return { hits, possibles };
 }
 
+function dedupeByPerson(list) {
+  const map = new Map();
+  for (const item of list) {
+    const prev = map.get(item.personId);
+    if (!prev || item.dist < prev.dist) map.set(item.personId, item);
+  }
+  return Array.from(map.values()).sort((a,b) => a.dist - b.dist);
+}
+
 // ---------- Rendering ----------
+function clearBuckets() {
+  resultsFlagged.innerHTML = "";
+  resultsPossible.innerHTML = "";
+  resultsClear.innerHTML = "";
+  countFlagged.textContent = "0";
+  countPossible.textContent = "0";
+  countClear.textContent = "0";
+}
+
+function updateButtons() {
+  btnAddPerson.disabled = !personName.value.trim();
+  const pool = selectedPeople();
+  const poolSamples = pool.reduce((s,p) => s + (p.samples?.length || 0), 0);
+  btnScan.disabled = !modelsReady || (scanInput.files?.length || 0) === 0 || pool.length === 0 || poolSamples === 0;
+}
+
 function renderPeople() {
   peopleCount.textContent = `${people.length} people • ${totalSamples()} samples`;
 
@@ -229,7 +273,7 @@ function renderPeople() {
     delBtn.className = "btn btn--danger";
     delBtn.textContent = "Delete";
     delBtn.onclick = () => {
-      people = people.filter(x => x.id !== p.id);
+      people = people.filter((x) => x.id !== p.id);
       savePeople();
     };
     right.appendChild(delBtn);
@@ -254,6 +298,7 @@ function renderPeople() {
     clearSamplesBtn.onclick = () => {
       p.samples = [];
       savePeople();
+      setStatus(enrollStatus, `Cleared samples for ${p.name}.`);
     };
 
     actions.appendChild(selectBtn);
@@ -304,31 +349,14 @@ function renderScanPeople() {
   }
 }
 
-function clearBuckets() {
-  resultsFlagged.innerHTML = "";
-  resultsPossible.innerHTML = "";
-  resultsClear.innerHTML = "";
-  countFlagged.textContent = "0";
-  countPossible.textContent = "0";
-  countClear.textContent = "0";
-}
-
-function updateButtons() {
-  btnAddPerson.disabled = !personName.value.trim();
-  const pool = selectedPeople();
-  const poolSamples = pool.reduce((s,p)=>s+(p.samples?.length||0),0);
-  btnScan.disabled = !modelsReady || scanInput.files.length === 0 || pool.length === 0 || poolSamples === 0;
-}
-
 function renderAll() {
   renderPeople();
   renderScanPeople();
   updateButtons();
 }
-
 renderAll();
 
-// ---------- Models ----------
+// ---------- Model loading ----------
 async function loadModels() {
   setStatus(modelStatus, "Loading models…");
   try {
@@ -339,14 +367,20 @@ async function loadModels() {
     setStatus(modelStatus, "Models loaded ✓");
   } catch (e) {
     console.error(e);
+    modelsReady = false;
     setStatus(modelStatus, "Model load failed. Check /models and that .bin files exist.");
   }
   updateButtons();
 }
-
 loadModels();
 
-// ---------- People ----------
+// ---------- Defaults ----------
+if (threshold) {
+  threshold.value = String(DEFAULT_THRESHOLD);
+  thrVal.textContent = String(DEFAULT_THRESHOLD);
+}
+
+// ---------- People controls ----------
 personName.addEventListener("input", updateButtons);
 
 btnAddPerson.addEventListener("click", () => {
@@ -383,7 +417,12 @@ btnNone.addEventListener("click", () => {
   updateButtons();
 });
 
-// ---------- Enroll (drag/drop + file input) ----------
+// ---------- Threshold UI ----------
+threshold.addEventListener("input", () => {
+  thrVal.textContent = threshold.value;
+});
+
+// ---------- Dropzone ----------
 function setupDropzone(dropEl, onFiles) {
   dropEl.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -393,7 +432,7 @@ function setupDropzone(dropEl, onFiles) {
   dropEl.addEventListener("drop", (e) => {
     e.preventDefault();
     dropEl.classList.remove("dragover");
-    const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith("image/"));
+    const files = Array.from(e.dataTransfer.files || []).filter((f) => f.type.startsWith("image/"));
     onFiles(files);
   });
 }
@@ -402,6 +441,7 @@ setupDropzone(enrollDrop, async (files) => {
   await handleEnrollFiles(files);
 });
 
+// ---------- Enroll ----------
 enrollInput.addEventListener("change", async () => {
   const files = Array.from(enrollInput.files || []);
   await handleEnrollFiles(files);
@@ -413,7 +453,7 @@ async function handleEnrollFiles(files) {
   const pid = personSelect.value;
   if (!pid) return setStatus(enrollStatus, "Select a person first (left panel or dropdown).");
 
-  const person = people.find(p => p.id === pid);
+  const person = people.find((p) => p.id === pid);
   if (!person) return setStatus(enrollStatus, "Selected person not found.");
 
   crops.innerHTML = "";
@@ -424,47 +464,45 @@ async function handleEnrollFiles(files) {
   for (const file of files) {
     const img = await fileToImage(file);
 
-    let detections = await faceapi
-  .detectAllFaces(img, new faceapi.TinyFaceDetectorOptions(DETECTOR))
-  .withFaceLandmarks()
-  .withFaceDescriptors();
+    // Upscale for detection
+    const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE);
 
-if (!detections.length) {
-  // Fallback: more sensitive pass
-  detections = await faceapi
-    .detectAllFaces(
-      img,
-      new faceapi.TinyFaceDetectorOptions({
-        inputSize: 640,
-        scoreThreshold: 0.15
-      })
-    )
-    .withFaceLandmarks()
-    .withFaceDescriptors();
-}
+    // Detect on upscaled canvas
+    let detections = await detectAll(canvas, DETECTOR_ENROLL);
 
-if (!detections.length) continue;
+    // Fallback pass slightly more sensitive
+    if (!detections.length) {
+      detections = await detectAll(canvas, { inputSize: 608, scoreThreshold: 0.04 });
+    }
 
-    // cap to avoid crazy crowd shots
+    if (!detections.length) {
+      continue;
+    }
+
+    // Cap number of faces
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
 
-    const tmp = document.createElement("canvas");
-    tmp.width = img.width; tmp.height = img.height;
-    const tctx = tmp.getContext("2d");
-    tctx.drawImage(img, 0, 0);
-
+    // We'll crop from the ORIGINAL image so face crops look sharp.
+    // Convert detection boxes from upscaled coordinates back to original:
     for (const det of trimmed) {
       found++;
       const box = det.detection.box;
-      const pad = Math.max(10, Math.round(Math.min(box.width, box.height) * 0.15));
-      const x = Math.max(0, Math.floor(box.x - pad));
-      const y = Math.max(0, Math.floor(box.y - pad));
-      const w = Math.min(img.width - x, Math.floor(box.width + pad * 2));
-      const h = Math.min(img.height - y, Math.floor(box.height + pad * 2));
+
+      const ox = box.x / scale;
+      const oy = box.y / scale;
+      const ow = box.width / scale;
+      const oh = box.height / scale;
+
+      const pad = Math.max(12, Math.round(Math.min(ow, oh) * 0.18));
+      const x = Math.max(0, Math.floor(ox - pad));
+      const y = Math.max(0, Math.floor(oy - pad));
+      const w = Math.min(img.width - x, Math.floor(ow + pad * 2));
+      const h = Math.min(img.height - y, Math.floor(oh + pad * 2));
 
       const crop = document.createElement("canvas");
-      crop.width = 180; crop.height = 180;
-      crop.getContext("2d").drawImage(tmp, x, y, w, h, 0, 0, crop.width, crop.height);
+      crop.width = 180;
+      crop.height = 180;
+      crop.getContext("2d").drawImage(img, x, y, w, h, 0, 0, crop.width, crop.height);
       const dataUrl = crop.toDataURL("image/jpeg", 0.86);
 
       const descriptor = Array.from(det.descriptor);
@@ -494,13 +532,17 @@ if (!detections.length) continue;
     await yieldToUI();
   }
 
-  setStatus(enrollStatus, found ? `Found ${found} face(s). Click crops to add samples to ${person.name}.` : "No faces found.");
+  if (!found) {
+    setStatus(
+      enrollStatus,
+      "No faces found. Try a clearer/closer photo (face larger, less blur). If this is a tiny thumbnail, it may not detect."
+    );
+  } else {
+    setStatus(enrollStatus, `Found ${found} face(s). Click crops to add samples to ${person.name}.`);
+  }
 }
 
 // ---------- Scan ----------
-threshold.addEventListener("input", () => {
-  thrVal.textContent = threshold.value;
-});
 scanInput.addEventListener("change", updateButtons);
 
 btnScan.addEventListener("click", async () => {
@@ -510,9 +552,9 @@ btnScan.addEventListener("click", async () => {
   if (!files.length) return;
 
   const pool = selectedPeople();
-  const poolSamples = pool.reduce((s,p)=>s+(p.samples?.length||0),0);
+  const poolSamples = pool.reduce((s, p) => s + (p.samples?.length || 0), 0);
   if (!pool.length || poolSamples === 0) {
-    return setStatus(scanStatus, "No selected people with samples. Check your scan filters + enroll at least 1 sample.");
+    return setStatus(scanStatus, "No selected people with samples. Check filters and enroll samples first.");
   }
 
   const thr = parseFloat(threshold.value);
@@ -527,50 +569,29 @@ btnScan.addEventListener("click", async () => {
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    setStatus(scanStatus, `Scanning ${i + 1} / ${files.length}…`);
 
-    setStatus(scanStatus, `Scanning ${i+1} / ${files.length}…`);
     const img = await fileToImage(file);
 
-// Upscale small images so the detector has enough pixels to work with
-const minSide = Math.min(img.width, img.height);
-const scale = minSide < 300 ? (300 / minSide) : 1;  // bump tiny thumbs up to ~300px min side
+    // Upscale for better small-face detection (crowd/stage)
+    const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE);
 
-const canvas = document.createElement("canvas");
-canvas.width = Math.round(img.width * scale);
-canvas.height = Math.round(img.height * scale);
-const ctx = canvas.getContext("2d");
-ctx.imageSmoothingEnabled = true;
-ctx.imageSmoothingQuality = "high";
-ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    // Detect on upscaled canvas
+    let detections = await detectAll(canvas, DETECTOR_SCAN);
 
-// Detect on the upscaled canvas (NOT the tiny original)
-let detections = await faceapi
-  .detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions(DETECTOR))
-  .withFaceLandmarks()
-  .withFaceDescriptors();
-
-// Optional fallback pass (even more sensitive)
-if (!detections.length) {
-  detections = await faceapi
-    .detectAllFaces(
-      canvas,
-      new faceapi.TinyFaceDetectorOptions({ inputSize: 608, scoreThreshold: 0.05 })
-    )
-    .withFaceLandmarks()
-    .withFaceDescriptors();
-}
-
-if (!detections.length) continue;
+    // Fallback more sensitive (may increase false detections, but helps stage shots)
+    if (!detections.length) {
+      detections = await detectAll(canvas, { inputSize: 608, scoreThreshold: 0.04 });
+    }
 
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
 
-    // For each face, compute matches to selected people
-    const faceResults = trimmed.map(det => {
+    // For each face, compute matches
+    const faceResults = trimmed.map((det) => {
       const desc = Array.from(det.descriptor);
       const m = matchesForDescriptor(desc, thr);
-      // choose best candidate among hits, else possibles
       const best = m.hits[0] || m.possibles[0] || null;
-      return { det, ...m, best };
+      return { det, ...m, best, scale };
     });
 
     // Determine image status
@@ -582,30 +603,19 @@ if (!detections.length) continue;
       else if (fr.possibles.length) imagePossibles.push(...fr.possibles);
     }
 
-    // Deduplicate by person (keep best distance per person)
-    function dedupe(list) {
-      const map = new Map();
-      for (const item of list) {
-        const prev = map.get(item.personId);
-        if (!prev || item.dist < prev.dist) map.set(item.personId, item);
-      }
-      return Array.from(map.values()).sort((a,b)=>a.dist-b.dist);
-    }
-    const uniqHits = dedupe(imageHits);
-    const uniqPoss = dedupe(imagePossibles);
+    const uniqHits = dedupeByPerson(imageHits);
+    const uniqPoss = dedupeByPerson(imagePossibles);
 
     let status = "clear";
     if (uniqHits.length) status = "flagged";
     else if (uniqPoss.length) status = "possible";
 
-    // Build label string
-    const names = (status === "flagged" ? uniqHits : status === "possible" ? uniqPoss : [])
-      .slice(0, 3)
-      .map(x => `${x.name} (${x.confidence}%)`);
-    const more = ((status === "flagged" ? uniqHits : status === "possible" ? uniqPoss : [])).length - 3;
+    const listForLabel = status === "flagged" ? uniqHits : status === "possible" ? uniqPoss : [];
+    const names = listForLabel.slice(0, 3).map((x) => `${x.name} (${x.confidence}%)`);
+    const more = listForLabel.length - 3;
     const label = names.length ? `${names.join(", ")}${more > 0 ? ` +${more}` : ""}` : "—";
 
-    // Render row into correct bucket
+    // Render result row
     const row = document.createElement("div");
     row.className = "result";
 
@@ -627,9 +637,7 @@ if (!detections.length) continue;
     const btnPrev = document.createElement("button");
     btnPrev.className = "btn btn--ghost btn--sm";
     btnPrev.textContent = "Preview";
-    btnPrev.onclick = () => {
-      drawPreview(img, faceResults, thr, possibleThr);
-    };
+    btnPrev.onclick = () => drawPreview(img, faceResults, thr, possibleThr);
 
     right.appendChild(tag);
     right.appendChild(btnPrev);
@@ -640,17 +648,14 @@ if (!detections.length) continue;
     if (status === "flagged") {
       resultsFlagged.appendChild(row);
       flaggedCount++;
-      // auto-preview first flagged
       if (flaggedCount === 1) drawPreview(img, faceResults, thr, possibleThr);
     } else if (status === "possible") {
       resultsPossible.appendChild(row);
       possibleCount++;
-      // if nothing flagged yet, auto-preview first possible
       if (flaggedCount === 0 && possibleCount === 1) drawPreview(img, faceResults, thr, possibleThr);
     } else {
       resultsClear.appendChild(row);
       clearCount++;
-      // if nothing else yet, auto-preview first clear
       if (flaggedCount === 0 && possibleCount === 0 && clearCount === 1) drawPreview(img, faceResults, thr, possibleThr);
     }
 
@@ -663,10 +668,11 @@ if (!detections.length) continue;
 
   setStatus(
     scanStatus,
-    `Done. Flagged ${flaggedCount} • Possible ${possibleCount} • Clear ${clearCount}. Threshold ${thr.toFixed(2)} (Possible up to ${ (thr + BORDERLINE_BAND).toFixed(2) }).`
+    `Done. Flagged ${flaggedCount} • Possible ${possibleCount} • Clear ${clearCount}. Threshold ${thr.toFixed(2)} (Possible up to ${(thr + BORDERLINE_BAND).toFixed(2)}).`
   );
 });
 
+// ---------- Preview ----------
 function clearPreview() {
   const ctx = previewCanvas.getContext("2d");
   previewCanvas.width = 1;
@@ -677,10 +683,10 @@ function clearPreview() {
 function drawPreview(img, faceResults, thr, possibleThr) {
   const ctx = previewCanvas.getContext("2d");
   const maxW = 1100;
-  const scale = Math.min(1, maxW / img.width);
+  const scaleCanvas = Math.min(1, maxW / img.width);
 
-  previewCanvas.width = Math.round(img.width * scale);
-  previewCanvas.height = Math.round(img.height * scale);
+  previewCanvas.width = Math.round(img.width * scaleCanvas);
+  previewCanvas.height = Math.round(img.height * scaleCanvas);
 
   ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
   ctx.drawImage(img, 0, 0, previewCanvas.width, previewCanvas.height);
@@ -690,12 +696,21 @@ function drawPreview(img, faceResults, thr, possibleThr) {
   ctx.textBaseline = "top";
 
   for (const fr of faceResults) {
+    const detScale = fr.scale || 1; // detection upscale
     const b = fr.det.detection.box;
-    const x = b.x * scale, y = b.y * scale, w = b.width * scale, h = b.height * scale;
 
-    // choose best match (flagged first, else possible)
+    // Convert detection box (upscaled) back to original image coords, then to preview canvas coords
+    const ox = (b.x / detScale);
+    const oy = (b.y / detScale);
+    const ow = (b.width / detScale);
+    const oh = (b.height / detScale);
+
+    const x = ox * scaleCanvas;
+    const y = oy * scaleCanvas;
+    const w = ow * scaleCanvas;
+    const h = oh * scaleCanvas;
+
     const best = fr.best;
-
     let level = "clear";
     if (best?.dist <= thr) level = "flagged";
     else if (best?.dist <= possibleThr) level = "possible";
@@ -769,6 +784,6 @@ helpDialog.addEventListener("click", (e) => {
   if (!inDialog) helpDialog.close();
 });
 
-// Keep selection sane on load
+// ---------- Init ----------
 syncSelection();
 renderAll();
