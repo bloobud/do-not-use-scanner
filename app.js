@@ -60,8 +60,8 @@ let scanSelection = loadSelection();
 
 // Performance knobs
 const DETECTOR = {
-  inputSize: 512,         // 320 = faster, 512 = better
-  scoreThreshold: 0.35    // lower = more sensitive
+  inputSize: 640,         // 320 = faster, 512 = better
+  scoreThreshold: 0.20    // lower = more sensitive
 };
 const BORDERLINE_BAND = 0.06; // threshold -> threshold+band = "Possible"
 const MAX_FACES_PER_IMAGE = 20; // sanity cap
@@ -424,12 +424,26 @@ async function handleEnrollFiles(files) {
   for (const file of files) {
     const img = await fileToImage(file);
 
-    const detections = await faceapi
-      .detectAllFaces(img, new faceapi.TinyFaceDetectorOptions(DETECTOR))
-      .withFaceLandmarks()
-      .withFaceDescriptors();
+    let detections = await faceapi
+  .detectAllFaces(img, new faceapi.TinyFaceDetectorOptions(DETECTOR))
+  .withFaceLandmarks()
+  .withFaceDescriptors();
 
-    if (!detections.length) continue;
+if (!detections.length) {
+  // Fallback: more sensitive pass
+  detections = await faceapi
+    .detectAllFaces(
+      img,
+      new faceapi.TinyFaceDetectorOptions({
+        inputSize: 640,
+        scoreThreshold: 0.15
+      })
+    )
+    .withFaceLandmarks()
+    .withFaceDescriptors();
+}
+
+if (!detections.length) continue;
 
     // cap to avoid crazy crowd shots
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
