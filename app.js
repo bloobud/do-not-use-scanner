@@ -3,7 +3,7 @@
 // Usable v1: People list + multiple samples/person + scan batch + preview boxes
 // Requires face-api.js models hosted at MODEL_URL.
 
-const MODEL_URL = "https://dashing-bavarois-f3bc73.netlify.app/models"; // <-- CHANGE THIS
+const MODEL_URL = "/models"; // <-- CHANGE THIS
 
 // Elements
 const el = (id) => document.getElementById(id);
