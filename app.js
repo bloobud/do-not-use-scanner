@@ -1,8 +1,8 @@
-// app.js — DNU Scanner (performance + stability update)
+// app.js — DNU Scanner
 // - Only labels the SINGLE closest match from enrolled people
 // - Only draws boxes for matched faces
 // - Filters bogus detections (prevents "arm/torso is a face")
-// - Upscales images to help small faces, BUT caps max dimension so it won’t hang
+// - Speeds up + prevents “stuck at 5/32” by using TFJS scopes + smaller detector
 // Models must be at /models on the SAME site.
 
 const MODEL_URL = "/models";
@@ -59,26 +59,24 @@ let people = loadPeople();            // [{id, name, samples:number[][]}]
 let scanSelection = loadSelection();  // { [id]: boolean }
 
 // -------------------- Settings --------------------
-// Detector settings
-const DETECTOR_ENROLL = { inputSize: 608, scoreThreshold: 0.12 };
-const DETECTOR_SCAN   = { inputSize: 608, scoreThreshold: 0.12 };
+// ✅ Faster + less “stuck”: smaller inputSize + capped working canvas
+const DETECTOR_ENROLL = { inputSize: 416, scoreThreshold: 0.12 };
+const DETECTOR_SCAN   = { inputSize: 416, scoreThreshold: 0.12 };
 
-// Fallback: slightly MORE sensitive (lower threshold), not stricter.
-// (Higher scoreThreshold = stricter, which often finds fewer faces.)
-const DETECTOR_FALLBACK = { inputSize: 608, scoreThreshold: 0.06 };
+// Fallback: slightly more sensitive if no faces are found
+const DETECTOR_FALLBACK = { inputSize: 416, scoreThreshold: 0.06 };
 
-const ENROLL_MIN_SIDE = 700;
-const SCAN_MIN_SIDE   = 900;
+// Upscale a little if tiny faces, but also cap max dimensions to avoid huge GPU work
+const ENROLL_MIN_SIDE = 650;
+const SCAN_MIN_SIDE   = 750;
 
-// Performance caps
-const MAX_DIM_ENROLL = 1600; // cap processing canvas (enroll)
-const MAX_DIM_SCAN   = 1400; // cap processing canvas (scan) — lower = faster
-const MAX_FACES_PER_IMAGE_ENROLL = 30;
-const MAX_FACES_PER_IMAGE_SCAN   = 15; // lower this to avoid crowd-photo slowdowns
+// Hard cap (prevents 6000x4000 photos from melting the browser)
+const MAX_DIM_ENROLL = 1100;
+const MAX_DIM_SCAN   = 1100;
 
-// Timeouts (ms)
-const DETECT_TIMEOUT_MS = 15000;   // detection+descriptor timeout per image
-const FILE_DECODE_TIMEOUT_MS = 8000;
+// Prevent “crowd photo explosion”
+const MAX_FACES_PER_IMAGE = 30;
+const MAX_FACES_PER_IMAGE_SCAN = 12;
 
 // Start strict for “only show real matches”
 const DEFAULT_THRESHOLD = 0.55;
@@ -88,6 +86,24 @@ const MIN_FACE_PX = 40;            // too small → ignore
 const MIN_DET_SCORE = 0.35;        // too low confidence → ignore
 const MIN_AR = 0.65;               // aspect ratio lower bound
 const MAX_AR = 1.60;               // aspect ratio upper bound
+
+// Skip extremely large images (extra safety)
+const MAX_MEGAPIXELS = 18; // ~18MP
+
+// -------------------- TFJS cleanup (prevents slowdown / “stuck”) --------------------
+function tfScopeStart() {
+  const tf = faceapi?.tf;
+  if (tf?.engine) tf.engine().startScope();
+}
+function tfScopeEnd() {
+  const tf = faceapi?.tf;
+  if (tf?.engine) tf.engine().endScope();
+}
+async function tfYield() {
+  const tf = faceapi?.tf;
+  if (tf?.nextFrame) await tf.nextFrame();
+  else await new Promise((r) => setTimeout(r, 0));
+}
 
 // -------------------- Helpers --------------------
 function uid() {
@@ -160,47 +176,30 @@ function distanceToConfidence(d, thr) {
   return Math.round(clamped * 100);
 }
 
+async function fileToImage(file) {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  URL.revokeObjectURL(url);
+  return img;
+}
+
 function yieldToUI() {
   return new Promise((r) => setTimeout(r, 0));
 }
 
-function withTimeout(promise, ms, label = "timeout") {
-  let t;
-  const timeout = new Promise((_, rej) => {
-    t = setTimeout(() => rej(new Error(label)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
-}
-
-async function fileToImage(file) {
-  // ObjectURL decode can hang on some formats; we guard it.
-  const url = URL.createObjectURL(file);
-  try {
-    const img = new Image();
-    img.decoding = "async";
-    img.src = url;
-
-    // img.decode() is best, but we wrap with timeout
-    await withTimeout(img.decode(), FILE_DECODE_TIMEOUT_MS, "image decode timed out");
-
-    return img;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
-// Upscale for small faces BUT cap max size so big photos don’t kill performance.
+// Upscale for better detection of small faces AND cap max dimensions
 function imageToDetectionCanvas(img, targetMinSide, maxDim) {
   const minSide = Math.min(img.width, img.height);
-  let scale = minSide < targetMinSide ? (targetMinSide / minSide) : 1;
+  const scaleUp = minSide < targetMinSide ? (targetMinSide / minSide) : 1;
 
-  // cap max dimension
-  const outW = Math.round(img.width * scale);
-  const outH = Math.round(img.height * scale);
-  const maxOut = Math.max(outW, outH);
-  if (maxOut > maxDim) {
-    scale = scale * (maxDim / maxOut);
-  }
+  // cap scale so the resulting canvas doesn't exceed maxDim
+  const maxScaleW = maxDim / img.width;
+  const maxScaleH = maxDim / img.height;
+  const capScale = Math.min(1, maxScaleW, maxScaleH);
+
+  const scale = Math.min(scaleUp, capScale);
 
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(img.width * scale));
@@ -219,6 +218,13 @@ async function detectAll(canvasOrImg, detectorOpts) {
     .detectAllFaces(canvasOrImg, new faceapi.TinyFaceDetectorOptions(detectorOpts))
     .withFaceLandmarks()
     .withFaceDescriptors();
+}
+
+// Run detector with fallback if needed
+async function safeDetect(canvas, optsPrimary, optsFallback) {
+  let det = await detectAll(canvas, optsPrimary);
+  if (!det.length && optsFallback) det = await detectAll(canvas, optsFallback);
+  return det;
 }
 
 // Filters bogus detections (prevents "arm as face")
@@ -516,26 +522,6 @@ enrollInput.addEventListener("change", async () => {
   enrollInput.value = "";
 });
 
-async function safeDetect(canvas, primary, fallback) {
-  // Detect with timeout + fallback
-  let dets = [];
-  try {
-    dets = await withTimeout(detectAll(canvas, primary), DETECT_TIMEOUT_MS, "detect timeout");
-  } catch (e) {
-    console.warn("detect timed out (primary)", e);
-    dets = [];
-  }
-  if (dets.length) return dets;
-
-  try {
-    dets = await withTimeout(detectAll(canvas, fallback), DETECT_TIMEOUT_MS, "detect timeout");
-  } catch (e) {
-    console.warn("detect timed out (fallback)", e);
-    dets = [];
-  }
-  return dets;
-}
-
 async function handleEnrollFiles(files) {
   if (!modelsReady) return setStatus(enrollStatus, "Models not ready yet.");
   const pid = personSelect.value;
@@ -550,71 +536,80 @@ async function handleEnrollFiles(files) {
   let found = 0;
 
   for (const file of files) {
-    let img;
+    tfScopeStart();
+
     try {
-      img = await fileToImage(file);
+      const img = await fileToImage(file);
+
+      // skip crazy huge
+      const mp = (img.width * img.height) / 1_000_000;
+      if (mp > MAX_MEGAPIXELS) {
+        console.warn("Skipping huge enroll image:", file.name, mp.toFixed(1), "MP");
+        continue;
+      }
+
+      const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE, MAX_DIM_ENROLL);
+
+      let detections = await safeDetect(canvas, DETECTOR_ENROLL, DETECTOR_FALLBACK);
+      if (!detections.length) continue;
+
+      const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
+
+      for (const det of trimmed) {
+        if (!isPlausibleFace(det, scale, img)) continue;
+
+        found++;
+        const box = det.detection.box;
+
+        // map detection coords (scaled canvas) back to original
+        const ox = box.x / scale;
+        const oy = box.y / scale;
+        const ow = box.width / scale;
+        const oh = box.height / scale;
+
+        // generous padding so descriptor sees more of the face
+        const pad = Math.max(12, Math.round(Math.min(ow, oh) * 0.18));
+        const x = Math.max(0, Math.floor(ox - pad));
+        const y = Math.max(0, Math.floor(oy - pad));
+        const w = Math.min(img.width - x, Math.floor(ow + pad * 2));
+        const h = Math.min(img.height - y, Math.floor(oh + pad * 2));
+
+        const crop = document.createElement("canvas");
+        crop.width = 180;
+        crop.height = 180;
+        crop.getContext("2d").drawImage(img, x, y, w, h, 0, 0, crop.width, crop.height);
+        const dataUrl = crop.toDataURL("image/jpeg", 0.86);
+
+        const descriptor = Array.from(det.descriptor);
+
+        const tile = document.createElement("div");
+        tile.className = "crop";
+
+        const im = document.createElement("img");
+        im.src = dataUrl;
+
+        const btn = document.createElement("button");
+        btn.textContent = "Add sample";
+        btn.onclick = () => {
+          person.samples.push(descriptor);
+          savePeople();
+          btn.textContent = "Added ✓";
+          btn.classList.add("added");
+          btn.disabled = true;
+          setStatus(enrollStatus, `Added sample to ${person.name}. Total: ${person.samples.length}`);
+        };
+
+        tile.appendChild(im);
+        tile.appendChild(btn);
+        crops.appendChild(tile);
+      }
     } catch (e) {
-      console.warn("Skipping unreadable image:", file.name, e);
-      continue;
+      console.warn("Enroll failed:", file.name, e);
+    } finally {
+      tfScopeEnd();
+      await tfYield();
+      await yieldToUI();
     }
-
-    const { canvas, scale } = imageToDetectionCanvas(img, ENROLL_MIN_SIDE, MAX_DIM_ENROLL);
-
-    const detections = await safeDetect(canvas, DETECTOR_ENROLL, DETECTOR_FALLBACK);
-    if (!detections.length) continue;
-
-    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE_ENROLL);
-
-    for (const det of trimmed) {
-      if (!isPlausibleFace(det, scale, img)) continue;
-
-      found++;
-      const box = det.detection.box;
-
-      // map detection coords (upscaled) back to original
-      const ox = box.x / scale;
-      const oy = box.y / scale;
-      const ow = box.width / scale;
-      const oh = box.height / scale;
-
-      // generous padding so descriptor sees more of the face
-      const pad = Math.max(12, Math.round(Math.min(ow, oh) * 0.18));
-      const x = Math.max(0, Math.floor(ox - pad));
-      const y = Math.max(0, Math.floor(oy - pad));
-      const w = Math.min(img.width - x, Math.floor(ow + pad * 2));
-      const h = Math.min(img.height - y, Math.floor(oh + pad * 2));
-
-      const crop = document.createElement("canvas");
-      crop.width = 180;
-      crop.height = 180;
-      crop.getContext("2d").drawImage(img, x, y, w, h, 0, 0, crop.width, crop.height);
-      const dataUrl = crop.toDataURL("image/jpeg", 0.86);
-
-      const descriptor = Array.from(det.descriptor);
-
-      const tile = document.createElement("div");
-      tile.className = "crop";
-
-      const im = document.createElement("img");
-      im.src = dataUrl;
-
-      const btn = document.createElement("button");
-      btn.textContent = "Add sample";
-      btn.onclick = () => {
-        person.samples.push(descriptor);
-        savePeople();
-        btn.textContent = "Added ✓";
-        btn.classList.add("added");
-        btn.disabled = true;
-        setStatus(enrollStatus, `Added sample to ${person.name}. Total: ${person.samples.length}`);
-      };
-
-      tile.appendChild(im);
-      tile.appendChild(btn);
-      crops.appendChild(tile);
-    }
-
-    await yieldToUI();
   }
 
   if (!found) {
@@ -654,83 +649,96 @@ btnScan.addEventListener("click", async () => {
     const file = files[i];
     setStatus(scanStatus, `Scanning ${i + 1} / ${files.length}…`);
 
-    let img;
+    tfScopeStart(); // ✅ critical: prevents tensor buildup
+
     try {
-      img = await fileToImage(file);
-    } catch (e) {
-      console.warn("Skipping unreadable image:", file.name, e);
-      continue;
+      let img;
+      try {
+        img = await fileToImage(file);
+      } catch (e) {
+        console.warn("Skipping unreadable image:", file.name, e);
+        continue;
+      }
+
+      // skip huge images
+      const mp = (img.width * img.height) / 1_000_000;
+      if (mp > MAX_MEGAPIXELS) {
+        console.warn("Skipping huge scan image:", file.name, mp.toFixed(1), "MP");
+        continue;
+      }
+
+      const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE, MAX_DIM_SCAN);
+
+      const detections = await safeDetect(canvas, DETECTOR_SCAN, DETECTOR_FALLBACK);
+      const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE_SCAN);
+
+      // compute best match only for plausible detections
+      const faceResults = [];
+      for (const det of trimmed) {
+        if (!isPlausibleFace(det, scale, img)) continue;
+
+        const desc = Array.from(det.descriptor);
+        const best = bestMatchForDescriptor(desc, thr);
+        faceResults.push({ det, best, scale });
+      }
+
+      const matchedFaces = faceResults.filter((fr) => fr.best);
+      const status = matchedFaces.length ? "flagged" : "clear";
+
+      const names = matchedFaces.length ? dedupeNames(matchedFaces.map((m) => m.best)) : [];
+      const label = names.length
+        ? `${names.slice(0, 3).join(", ")}${names.length > 3 ? ` +${names.length - 3}` : ""}`
+        : "—";
+
+      const row = document.createElement("div");
+      row.className = "result";
+
+      const left = document.createElement("div");
+      left.innerHTML = `
+        <div class="result__name">${escapeHtml(file.name)}</div>
+        <div class="result__sub">
+          ${trimmed.length} face(s) detected • ${status === "clear" ? "No matches" : `Matched: ${escapeHtml(label)}`}
+        </div>
+      `;
+
+      const right = document.createElement("div");
+      right.className = "result__right";
+
+      const tag = document.createElement("span");
+      tag.className = `tag ${status === "flagged" ? "tag--bad" : "tag--good"}`;
+      tag.textContent = status === "flagged" ? "MATCH" : "CLEAR";
+
+      const btnPrev = document.createElement("button");
+      btnPrev.className = "btn btn--ghost btn--sm";
+      btnPrev.textContent = "Preview";
+      btnPrev.onclick = () => drawPreview(img, faceResults);
+
+      right.appendChild(tag);
+      right.appendChild(btnPrev);
+
+      row.appendChild(left);
+      row.appendChild(right);
+
+      if (status === "flagged") {
+        resultsFlagged.appendChild(row);
+        flaggedCount++;
+        if (flaggedCount === 1) drawPreview(img, faceResults);
+      } else {
+        resultsClear.appendChild(row);
+        clearCount++;
+        if (flaggedCount === 0 && clearCount === 1) drawPreview(img, faceResults);
+      }
+
+      countFlagged.textContent = String(flaggedCount);
+      countClear.textContent = String(clearCount);
+
+    } catch (err) {
+      console.warn("Scan failed for file:", file.name, err);
+    } finally {
+      tfScopeEnd();     // ✅ frees tensors
+      await tfYield();  // ✅ keeps UI responsive
+      await yieldToUI();
     }
-
-    const { canvas, scale } = imageToDetectionCanvas(img, SCAN_MIN_SIDE, MAX_DIM_SCAN);
-
-    const detections = await safeDetect(canvas, DETECTOR_SCAN, DETECTOR_FALLBACK);
-
-    const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE_SCAN);
-
-    // compute best match only for plausible detections
-    const faceResults = [];
-    for (const det of trimmed) {
-      if (!isPlausibleFace(det, scale, img)) continue;
-
-      const desc = Array.from(det.descriptor);
-      const best = bestMatchForDescriptor(desc, thr);
-      faceResults.push({ det, best, scale });
-    }
-
-    const matchedFaces = faceResults.filter((fr) => fr.best);
-
-    const status = matchedFaces.length ? "flagged" : "clear";
-
-    const names = matchedFaces.length ? dedupeNames(matchedFaces.map((m) => m.best)) : [];
-    const label = names.length
-      ? `${names.slice(0, 3).join(", ")}${names.length > 3 ? ` +${names.length - 3}` : ""}`
-      : "—";
-
-    const row = document.createElement("div");
-    row.className = "result";
-
-    const left = document.createElement("div");
-    left.innerHTML = `
-      <div class="result__name">${escapeHtml(file.name)}</div>
-      <div class="result__sub">
-        ${trimmed.length} face(s) detected • ${status === "clear" ? "No matches" : `Matched: ${escapeHtml(label)}`}
-      </div>
-    `;
-
-    const right = document.createElement("div");
-    right.className = "result__right";
-
-    const tag = document.createElement("span");
-    tag.className = `tag ${status === "flagged" ? "tag--bad" : "tag--good"}`;
-    tag.textContent = status === "flagged" ? "MATCH" : "CLEAR";
-
-    const btnPrev = document.createElement("button");
-    btnPrev.className = "btn btn--ghost btn--sm";
-    btnPrev.textContent = "Preview";
-    btnPrev.onclick = () => drawPreview(img, faceResults);
-
-    right.appendChild(tag);
-    right.appendChild(btnPrev);
-
-    row.appendChild(left);
-    row.appendChild(right);
-
-    if (status === "flagged") {
-      resultsFlagged.appendChild(row);
-      flaggedCount++;
-      if (flaggedCount === 1) drawPreview(img, faceResults);
-    } else {
-      resultsClear.appendChild(row);
-      clearCount++;
-      if (flaggedCount === 0 && clearCount === 1) drawPreview(img, faceResults);
-    }
-
-    countFlagged.textContent = String(flaggedCount);
-    countClear.textContent = String(clearCount);
-
-    // Important: yield so the UI remains responsive
-    await yieldToUI();
   }
 
   setStatus(
