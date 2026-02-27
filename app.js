@@ -60,8 +60,8 @@ let scanSelection = loadSelection();
 
 // Performance knobs
 const DETECTOR = {
-  inputSize: 640,         // 320 = faster, 512 = better
-  scoreThreshold: 0.20    // lower = more sensitive
+  inputSize: 416,         // 320 = faster, 512 = better
+  scoreThreshold: 0.10    // lower = more sensitive
 };
 const BORDERLINE_BAND = 0.06; // threshold -> threshold+band = "Possible"
 const MAX_FACES_PER_IMAGE = 20; // sanity cap
@@ -531,10 +531,36 @@ btnScan.addEventListener("click", async () => {
     setStatus(scanStatus, `Scanning ${i+1} / ${files.length}…`);
     const img = await fileToImage(file);
 
-    const detections = await faceapi
-      .detectAllFaces(img, new faceapi.TinyFaceDetectorOptions(DETECTOR))
-      .withFaceLandmarks()
-      .withFaceDescriptors();
+// Upscale small images so the detector has enough pixels to work with
+const minSide = Math.min(img.width, img.height);
+const scale = minSide < 300 ? (300 / minSide) : 1;  // bump tiny thumbs up to ~300px min side
+
+const canvas = document.createElement("canvas");
+canvas.width = Math.round(img.width * scale);
+canvas.height = Math.round(img.height * scale);
+const ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = true;
+ctx.imageSmoothingQuality = "high";
+ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+// Detect on the upscaled canvas (NOT the tiny original)
+let detections = await faceapi
+  .detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions(DETECTOR))
+  .withFaceLandmarks()
+  .withFaceDescriptors();
+
+// Optional fallback pass (even more sensitive)
+if (!detections.length) {
+  detections = await faceapi
+    .detectAllFaces(
+      canvas,
+      new faceapi.TinyFaceDetectorOptions({ inputSize: 608, scoreThreshold: 0.05 })
+    )
+    .withFaceLandmarks()
+    .withFaceDescriptors();
+}
+
+if (!detections.length) continue;
 
     const trimmed = detections.slice(0, MAX_FACES_PER_IMAGE);
 
