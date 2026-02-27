@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Do Not Use Scanner</title>
   <link rel="preconnect" href="https://unpkg.com" />
-  <link rel="stylesheet" href="https://scintillating-souffle-547a07.netlify.app/styles.css" />
+  <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="topbar">
@@ -56,6 +56,7 @@
       </div>
 
       <div class="grid2">
+        <!-- Enroll -->
         <div class="card">
           <div class="card__title">1) Add face samples</div>
           <div class="card__sub">Select a person, upload photos, then click face crops to add samples.</div>
@@ -77,35 +78,75 @@
           <div class="crops" id="crops"></div>
         </div>
 
+        <!-- Scan -->
         <div class="card">
           <div class="card__title">2) Scan photos</div>
           <div class="card__sub">Upload a batch. We’ll flag photos that contain restricted people.</div>
 
-          <div class="row">
+          <!-- People filter -->
+          <div class="filter">
+            <div class="filter__top">
+              <div><b>Scan against</b> <span class="muted">(choose people)</span></div>
+              <div class="filter__actions">
+                <button id="btnAll" class="btn btn--ghost btn--sm">All</button>
+                <button id="btnNone" class="btn btn--ghost btn--sm">None</button>
+              </div>
+            </div>
+            <div id="scanPeople" class="filter__list"></div>
+            <div class="muted small">Tip: uncheck someone temporarily instead of deleting them.</div>
+          </div>
+
+          <div class="row" style="margin-top:10px;">
             <label class="btn btn--primary">
               Upload Batch
               <input id="scanInput" type="file" accept="image/*" multiple hidden />
             </label>
-
             <button id="btnScan" class="btn btn--ghost" disabled>Scan</button>
           </div>
 
+          <!-- Threshold + borderline band -->
           <div class="slider">
             <div class="slider__top">
               <div><b>Match threshold</b> <span class="muted">(lower = stricter)</span></div>
               <div class="pill">Distance: <span id="thrVal">0.52</span></div>
             </div>
             <input id="threshold" type="range" min="0.35" max="0.75" step="0.01" value="0.52" />
-            <div class="muted small">Typical: 0.45–0.60. If you’re getting false flags, lower it. If you’re missing matches, raise it slightly.</div>
+            <div class="muted small">
+              Typical: 0.45–0.60. Flagged = below threshold. Possible = slightly above (borderline).
+            </div>
           </div>
 
           <div class="muted small" id="scanStatus"></div>
-          <div class="results" id="results"></div>
+
+          <!-- Result buckets -->
+          <div class="bucket">
+            <div class="bucket__head">
+              <div class="bucket__title">Flagged</div>
+              <div class="muted small" id="countFlagged">0</div>
+            </div>
+            <div class="results" id="resultsFlagged"></div>
+          </div>
+
+          <div class="bucket">
+            <div class="bucket__head">
+              <div class="bucket__title">Possible</div>
+              <div class="muted small" id="countPossible">0</div>
+            </div>
+            <div class="results" id="resultsPossible"></div>
+          </div>
+
+          <div class="bucket">
+            <div class="bucket__head">
+              <div class="bucket__title">Clear</div>
+              <div class="muted small" id="countClear">0</div>
+            </div>
+            <div class="results" id="resultsClear"></div>
+          </div>
 
           <div class="preview">
             <div class="preview__head">
               <div class="card__title">Preview</div>
-              <div class="muted small">Red boxes = restricted match</div>
+              <div class="muted small">Red = flagged • Amber = possible</div>
             </div>
             <canvas id="previewCanvas"></canvas>
           </div>
@@ -123,8 +164,9 @@
       <ol class="help">
         <li><b>Add people</b> in the left panel.</li>
         <li>Select a person → upload photos → click face crops to save samples.</li>
-        <li>Upload a new batch → click <b>Scan</b> → review flagged photos + preview.</li>
-        <li>Use <b>Export People</b> to back up your list (or share between computers).</li>
+        <li>Choose which people to scan against → upload batch → click <b>Scan</b>.</li>
+        <li><b>Flagged</b> = strong match. <b>Possible</b> = borderline (review manually).</li>
+        <li>Use <b>Export/Import</b> to back up or share your list between computers.</li>
       </ol>
       <div class="fineprint">
         All processing happens in your browser. Photos are not uploaded to a third-party service.
@@ -133,6 +175,6 @@
   </dialog>
 
   <script defer src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
-  <script defer src="https://scintillating-souffle-547a07.netlify.app/app.js"></script>
+  <script defer src="./app.js"></script>
 </body>
 </html>
